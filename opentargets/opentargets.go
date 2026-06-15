@@ -1,38 +1,115 @@
 // Package opentargets is the library behind the opentargets command line:
-// the HTTP client, request shaping, and the typed data models for opentargets.
+// the HTTP client, GraphQL request shaping, and typed data models for the
+// Open Targets Platform — a disease-target association database covering
+// 60,000+ drug targets and 30,000+ diseases.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client posts GraphQL queries to the public API at
+// api.platform.opentargets.org. No API key is required.
 package opentargets
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to opentargets. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to the Open Targets API.
 const DefaultUserAgent = "opentargets/dev (+https://github.com/tamnd/opentargets-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at opentargets.com; change it once you
-// know the real endpoints you want to read.
-const Host = "opentargets.com"
+// Host is the API hostname and the host the URI driver in domain.go claims.
+const Host = "api.platform.opentargets.org"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// graphqlURL is the single GraphQL endpoint.
+const graphqlURL = "https://" + Host + "/api/v4/graphql"
 
-// Client talks to opentargets over HTTP.
+// platformURL is the base URL for human-readable links.
+const platformURL = "https://platform.opentargets.org"
+
+// --- wire types (match the API JSON shapes exactly) ---
+
+type wireTarget struct {
+	ID     string `json:"id"`
+	Symbol string `json:"approvedSymbol"`
+	Name   string `json:"approvedName"`
+	Bio    string `json:"biotype"`
+}
+
+type wireDisease struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type wireSearchHit struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type wireSearchResult struct {
+	Total int             `json:"total"`
+	Hits  []wireSearchHit `json:"hits"`
+}
+
+type wireAssocRow struct {
+	Score   float64      `json:"score"`
+	Disease *wireDisease `json:"disease,omitempty"`
+	Target  *wireTarget  `json:"target,omitempty"`
+}
+
+// --- public record types ---
+
+// Target is one gene/protein target from Open Targets.
+type Target struct {
+	ID      string `json:"id"      kit:"id"`
+	Symbol  string `json:"symbol,omitempty"`
+	Name    string `json:"name,omitempty"`
+	Biotype string `json:"biotype,omitempty"`
+}
+
+// Disease is one disease/phenotype from Open Targets.
+type Disease struct {
+	ID          string `json:"id"          kit:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+}
+
+// SearchResult is a single hit from a keyword search.
+type SearchResult struct {
+	ID   string `json:"id"   kit:"id"`
+	Name string `json:"name"`
+}
+
+// Association is a scored target-disease association.
+type Association struct {
+	TargetID     string  `json:"target_id,omitempty"`
+	TargetSymbol string  `json:"target_symbol,omitempty"`
+	DiseaseID    string  `json:"disease_id,omitempty"`
+	DiseaseName  string  `json:"disease_name,omitempty"`
+	Score        float64 `json:"score"`
+}
+
+// --- conversion helpers ---
+
+func targetFromWire(w *wireTarget) *Target {
+	return &Target{ID: w.ID, Symbol: w.Symbol, Name: w.Name, Biotype: w.Bio}
+}
+
+func diseaseFromWire(w *wireDisease) *Disease {
+	return &Disease{ID: w.ID, Name: w.Name, Description: w.Description}
+}
+
+// --- client ---
+
+// Client talks to the Open Targets GraphQL API.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	// BaseURL may be overridden in tests.
+	BaseURL string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,71 +117,234 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: 30s timeout, 300ms pacing,
+// three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   graphqlURL,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// do posts a GraphQL query and JSON-decodes the response into result.
+// The API returns {"data": <result>, "errors": [...]}.
+func (c *Client) do(ctx context.Context, query string, variables map[string]interface{}, result interface{}) error {
+	body, err := json.Marshal(map[string]interface{}{
+		"query":     query,
+		"variables": variables,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal graphql request: %w", err)
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
+
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL, bytes.NewReader(body))
+		if err != nil {
+			return err
 		}
-		lastErr = err
-		if !retry {
-			return nil, err
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", c.UserAgent)
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
 		}
+
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			_ = resp.Body.Close()
+			lastErr = fmt.Errorf("http %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
+			return fmt.Errorf("http %d", resp.StatusCode)
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Decode into {"data": result, "errors": [...]}
+		var envelope struct {
+			Data   json.RawMessage `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		if err := json.Unmarshal(respBody, &envelope); err != nil {
+			return fmt.Errorf("decode graphql envelope: %w", err)
+		}
+		if len(envelope.Errors) > 0 {
+			return fmt.Errorf("graphql error: %s", envelope.Errors[0].Message)
+		}
+		if err := json.Unmarshal(envelope.Data, result); err != nil {
+			return fmt.Errorf("decode graphql data: %w", err)
+		}
+		return nil
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return fmt.Errorf("opentargets: %w", lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
+// SearchTargets searches targets by keyword and returns matching results plus
+// the total hit count. limit ≤ 0 defaults to 10.
+func (c *Client) SearchTargets(ctx context.Context, q string, limit int) ([]*SearchResult, int, error) {
+	if limit <= 0 {
+		limit = 10
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
+	const gql = `
+query($q: String!, $size: Int!) {
+  search(queryString: $q, entityNames: ["target"], page: {index: 0, size: $size}) {
+    total
+    hits { id name }
+  }
+}`
+	var data struct {
+		Search wireSearchResult `json:"search"`
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
+	if err := c.do(ctx, gql, map[string]interface{}{"q": q, "size": limit}, &data); err != nil {
+		return nil, 0, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+	out := make([]*SearchResult, 0, len(data.Search.Hits))
+	for _, h := range data.Search.Hits {
+		out = append(out, &SearchResult{ID: h.ID, Name: h.Name})
 	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
+	return out, data.Search.Total, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// GetTarget fetches a single target by Ensembl ID (e.g. "ENSG00000141510").
+func (c *Client) GetTarget(ctx context.Context, ensemblID string) (*Target, error) {
+	const gql = `
+query($id: String!) {
+  target(ensemblId: $id) { id approvedSymbol approvedName biotype }
+}`
+	var data struct {
+		Target *wireTarget `json:"target"`
+	}
+	if err := c.do(ctx, gql, map[string]interface{}{"id": ensemblID}, &data); err != nil {
+		return nil, err
+	}
+	if data.Target == nil {
+		return nil, fmt.Errorf("target not found: %s", ensemblID)
+	}
+	return targetFromWire(data.Target), nil
+}
+
+// GetDisease fetches a single disease by EFO ID (e.g. "EFO_0000311").
+func (c *Client) GetDisease(ctx context.Context, efoID string) (*Disease, error) {
+	const gql = `
+query($id: String!) {
+  disease(efoId: $id) { id name description }
+}`
+	var data struct {
+		Disease *wireDisease `json:"disease"`
+	}
+	if err := c.do(ctx, gql, map[string]interface{}{"id": efoID}, &data); err != nil {
+		return nil, err
+	}
+	if data.Disease == nil {
+		return nil, fmt.Errorf("disease not found: %s", efoID)
+	}
+	return diseaseFromWire(data.Disease), nil
+}
+
+// TargetDiseases returns the top diseases associated with a target, ordered by
+// association score. limit ≤ 0 defaults to 10.
+func (c *Client) TargetDiseases(ctx context.Context, ensemblID string, limit int) ([]*Association, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	const gql = `
+query($id: String!, $size: Int!) {
+  target(ensemblId: $id) {
+    associatedDiseases(page: {index: 0, size: $size}) {
+      count
+      rows { disease { id name } score }
+    }
+  }
+}`
+	var data struct {
+		Target *struct {
+			AssociatedDiseases struct {
+				Rows []wireAssocRow `json:"rows"`
+			} `json:"associatedDiseases"`
+		} `json:"target"`
+	}
+	if err := c.do(ctx, gql, map[string]interface{}{"id": ensemblID, "size": limit}, &data); err != nil {
+		return nil, err
+	}
+	if data.Target == nil {
+		return nil, fmt.Errorf("target not found: %s", ensemblID)
+	}
+	var out []*Association
+	for _, r := range data.Target.AssociatedDiseases.Rows {
+		a := &Association{Score: r.Score}
+		if r.Disease != nil {
+			a.DiseaseID = r.Disease.ID
+			a.DiseaseName = r.Disease.Name
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// DiseaseTargets returns the top targets associated with a disease, ordered by
+// association score. limit ≤ 0 defaults to 10.
+func (c *Client) DiseaseTargets(ctx context.Context, efoID string, limit int) ([]*Association, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	const gql = `
+query($id: String!, $size: Int!) {
+  disease(efoId: $id) {
+    associatedTargets(page: {index: 0, size: $size}) {
+      count
+      rows { target { id approvedSymbol } score }
+    }
+  }
+}`
+	var data struct {
+		Disease *struct {
+			AssociatedTargets struct {
+				Rows []wireAssocRow `json:"rows"`
+			} `json:"associatedTargets"`
+		} `json:"disease"`
+	}
+	if err := c.do(ctx, gql, map[string]interface{}{"id": efoID, "size": limit}, &data); err != nil {
+		return nil, err
+	}
+	if data.Disease == nil {
+		return nil, fmt.Errorf("disease not found: %s", efoID)
+	}
+	var out []*Association
+	for _, r := range data.Disease.AssociatedTargets.Rows {
+		a := &Association{Score: r.Score}
+		if r.Target != nil {
+			a.TargetID = r.Target.ID
+			a.TargetSymbol = r.Target.Symbol
+		}
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// pace blocks until at least Rate has elapsed since the last request.
 func (c *Client) pace() {
 	if c.Rate <= 0 {
 		return
@@ -121,80 +361,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on opentargets.com. It is a stand-in for the typed records you
-// will model from the real opentargets endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `opentargets cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

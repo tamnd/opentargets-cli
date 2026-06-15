@@ -2,7 +2,6 @@ package opentargets
 
 import (
 	"context"
-	"net/url"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,12 +18,9 @@ import (
 // opentargets:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone opentargets binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the opentargets driver. It carries no state; the per-run client is
+// Domain is the Open Targets driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,40 +32,41 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "opentargets",
-			Short:  "A command line for opentargets.",
-			Long: `A command line for opentargets.
+			Short:  "A command line for the Open Targets Platform.",
+			Long: `A command line for the Open Targets Platform.
 
-opentargets reads public opentargets data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+opentargets queries the Open Targets disease-target association database,
+covering 60,000+ drug targets and 30,000+ diseases. Look up targets by Ensembl
+ID, diseases by EFO ID, search by keyword, and explore associations. No API key
+required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/opentargets-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `opentargets page` and
-	// `ant get opentargets://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search targets by keyword (--limit)",
+		Args:    []kit.Arg{{Name: "query", Help: "keyword to search (e.g. cancer)"}}}, searchTargets)
 
-	// List op: members of a page, the home of `opentargets links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// opentargets://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "target", Group: "read", Single: true,
+		Summary: "Get target info by Ensembl ID", URIType: "target", Resolver: true,
+		Args: []kit.Arg{{Name: "ensembl-id", Help: "Ensembl gene ID (e.g. ENSG00000141510)"}}}, getTarget)
+
+	kit.Handle(app, kit.OpMeta{Name: "disease", Group: "read", Single: true,
+		Summary: "Get disease info by EFO ID", URIType: "disease", Resolver: true,
+		Args: []kit.Arg{{Name: "efo-id", Help: "EFO disease ID (e.g. EFO_0000311)"}}}, getDisease)
+
+	kit.Handle(app, kit.OpMeta{Name: "associations", Group: "read", List: true,
+		Summary: "Get disease associations for a target (--limit)",
+		Args:    []kit.Arg{{Name: "target-id", Help: "Ensembl gene ID (e.g. ENSG00000141510)"}}}, targetAssociations)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -87,87 +84,98 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
-}
-
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"          help:"keyword to search"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type targetInput struct {
+	EnsemblID string  `kit:"arg"   help:"Ensembl gene ID"`
+	Client    *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+type diseaseInput struct {
+	EFOID  string  `kit:"arg"   help:"EFO disease ID"`
+	Client *Client `kit:"inject"`
+}
+
+type associationsInput struct {
+	TargetID string  `kit:"arg"          help:"Ensembl gene ID"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
+}
+
+// --- handlers ---
+
+func searchTargets(ctx context.Context, in searchInput, emit func(*SearchResult) error) error {
+	results, _, err := in.Client.SearchTargets(ctx, in.Query, in.Limit)
 	if err != nil {
-		return mapErr(err)
+		return err
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, r := range results {
+		if err := emit(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full opentargets.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized opentargets reference: %q", input)
+func getTarget(ctx context.Context, in targetInput, emit func(*Target) error) error {
+	t, err := in.Client.GetTarget(ctx, in.EnsemblID)
+	if err != nil {
+		return err
 	}
-	return "page", id, nil
+	return emit(t)
+}
+
+func getDisease(ctx context.Context, in diseaseInput, emit func(*Disease) error) error {
+	d, err := in.Client.GetDisease(ctx, in.EFOID)
+	if err != nil {
+		return err
+	}
+	return emit(d)
+}
+
+func targetAssociations(ctx context.Context, in associationsInput, emit func(*Association) error) error {
+	assocs, err := in.Client.TargetDiseases(ctx, in.TargetID, in.Limit)
+	if err != nil {
+		return err
+	}
+	for _, a := range assocs {
+		if err := emit(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: pure string functions, no network ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// Any non-empty string is accepted as a target id by default; EFO IDs are
+// classified as diseases.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("opentargets: empty reference")
+	}
+	// EFO IDs begin with "EFO_" (or similar ontology prefixes).
+	// Ensembl IDs begin with "ENSG".
+	// Treat everything else as a target id (the primary resource).
+	return "target", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "target":
+		return platformURL + "/target/" + id, nil
+	case "disease":
+		return platformURL + "/disease/" + id, nil
+	default:
 		return "", errs.Usage("opentargets has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
 }
